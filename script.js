@@ -3,6 +3,7 @@ let gizmoScene, gizmoCamera, gizmoRenderer;
 let controls; // OrbitControls
 let pointsData = [];
 let typeData = []; // Store type information for each point
+let scalarData = []; // Store scalar information for each point (per frame)
 let currentFrame = 0;
 let isPlaying = false;
 let animationSpeed = 1.; // Slower default speed
@@ -11,9 +12,12 @@ let crossSectionMode = 'full'; // 'full', 'horizontal', 'vertical'
 let currentDataset = 'drosophila.csv'; // Track current dataset
 let totalFrames = 120; // Will be updated when loading data
 let maxPoints = 5000; // Will be updated when loading data
-let colorByType = false; // Track if coloring by type is enabled
+let colorMode = 'default'; // 'default' | 'type' | 'scalar-0' | ...
 let hasTypeData = false; // Track if current dataset has type information
 let typeNames = {}; // Store type value to name mapping
+let hasScalars = false; // Track if current dataset has scalar information
+let scalarNames = []; // Names of scalar fields
+let scalarRanges = []; // [{min, max}, ...] per scalar
 
 // Controls
 const datasetSelect = document.getElementById('datasetSelect');
@@ -27,7 +31,7 @@ const speedLabel = document.getElementById('speedLabel');
 const fullBtn = document.getElementById('fullBtn');
 const horizontalBtn = document.getElementById('horizontalBtn');
 const verticalBtn = document.getElementById('verticalBtn');
-const colorToggleBtn = document.getElementById('colorToggleBtn');
+const colorModeSelect = document.getElementById('colorModeSelect');
 
 // Color palette - different shades of green
 const typeColors = [
@@ -242,6 +246,44 @@ function updateGizmoOrientation() {
     gizmoCamera.lookAt(0, 0, 0);
 }
 
+// Configure the color mode select options based on available data
+function configureColorModeOptions() {
+    if (!colorModeSelect) return;
+    
+    // Clear existing options
+    while (colorModeSelect.firstChild) {
+        colorModeSelect.removeChild(colorModeSelect.firstChild);
+    }
+    
+    // Default grey mode
+    const defaultOption = document.createElement('option');
+    defaultOption.value = 'default';
+    defaultOption.textContent = 'Default (grey)';
+    colorModeSelect.appendChild(defaultOption);
+    
+    // By cell type (only if we have type data)
+    if (hasTypeData) {
+        const typeOption = document.createElement('option');
+        typeOption.value = 'type';
+        typeOption.textContent = 'By cell type';
+        colorModeSelect.appendChild(typeOption);
+    }
+    
+    // Scalars
+    if (hasScalars && scalarNames.length > 0) {
+        scalarNames.forEach((name, index) => {
+            const scalarOption = document.createElement('option');
+            scalarOption.value = `scalar-${index}`;
+            scalarOption.textContent = `By ${name}`;
+            colorModeSelect.appendChild(scalarOption);
+        });
+    }
+    
+    // Reset current mode and selection
+    colorMode = 'default';
+    colorModeSelect.value = 'default';
+}
+
 async function loadCSVData() {
     // Show loading screen at the start
     showLoadingScreen();
@@ -271,19 +313,26 @@ async function loadCSVData() {
         
         console.log(`Found ${totalFrames} frames with point counts:`, pointsPerFrame);
         
-        // Parse the second line for cell type names if it exists
+        // Parse header rows for type and scalar definitions
         typeNames = {};
+        scalarNames = [];
+        hasScalars = false;
+        hasTypeData = false;
+        scalarRanges = [];
         let dataStartLine = 1; // Default start line for data
         let hasExplicitTypeNames = false;
+        let hasTypeDictionary = false;
         
-        if (lines.length > 1) {
-            const secondLine = lines[1].trim();
-            // Check if second line contains type definitions (format: "val: name, val: name")
-            if (secondLine.includes(':') && secondLine.includes(',')) {
-                console.log('Found type definitions:', secondLine);
+        // Start looking at header lines after the first (counts) line
+        let headerIndex = 1;
+        
+        if (lines.length > headerIndex) {
+            const possibleTypeLine = lines[headerIndex].trim();
+            // Check if this line contains type definitions (format: "val: name, val: name")
+            if (possibleTypeLine.includes(':') && possibleTypeLine.includes(',')) {
+                console.log('Found type definitions:', possibleTypeLine);
                 
-                // Parse type definitions
-                const typeDefs = secondLine.split(',').map(def => def.trim());
+                const typeDefs = possibleTypeLine.split(',').map(def => def.trim());
                 for (const typeDef of typeDefs) {
                     const [val, name] = typeDef.split(':').map(s => s.trim());
                     if (val && name) {
@@ -292,24 +341,45 @@ async function loadCSVData() {
                 }
                 
                 console.log('Parsed type names:', typeNames);
-                dataStartLine = 2; // Data starts from third line
                 hasTypeData = Object.keys(typeNames).length > 0;
-                hasExplicitTypeNames = true;
-            } else {
-                // Check if we have type data by examining the first data line
-                const sampleCoords = secondLine.split(',');
+                hasExplicitTypeNames = hasTypeData;
+                hasTypeDictionary = hasTypeData;
+                headerIndex += 1;
+            }
+        }
+        
+        // Optional scalar definitions line
+        if (lines.length > headerIndex) {
+            const possibleScalarLine = lines[headerIndex].trim();
+            if (possibleScalarLine.toLowerCase().startsWith('scalars:')) {
+                console.log('Found scalar definitions:', possibleScalarLine);
+                const scalarPart = possibleScalarLine.split(':').slice(1).join(':');
+                scalarNames = scalarPart.split(',').map(name => name.trim()).filter(name => name.length > 0);
+                hasScalars = scalarNames.length > 0;
+                headerIndex += 1;
+            }
+        }
+        
+        // If we do not yet know whether we have type data, infer from the first data row,
+        // but only when there is no scalars header (to avoid ambiguity).
+        if (!hasTypeData && lines.length > headerIndex) {
+            const sampleLine = lines[headerIndex].trim();
+            const sampleCoords = sampleLine.split(',');
+            if (!hasScalars) {
                 hasTypeData = sampleCoords.length >= 4; // x, y, z, and possibly type
-                dataStartLine = 1; // Data starts from second line
+                hasExplicitTypeNames = false;
+            } else {
+                hasTypeData = false; // Scalars only, no types
                 hasExplicitTypeNames = false;
             }
-        } else {
-            hasTypeData = false;
-            hasExplicitTypeNames = false;
         }
+        
+        dataStartLine = headerIndex;
         
         // Clear existing data
         pointsData = [];
         typeData = [];
+        scalarData = [];
         
         // Parse CSV data into frames
         let lineIndex = dataStartLine;
@@ -318,26 +388,44 @@ async function loadCSVData() {
         for (let frame = 0; frame < totalFrames; frame++) {
             const frameData = [];
             const frameTypes = [];
+            const frameScalars = hasScalars ? [] : null;
             const pointCount = pointsPerFrame[frame];
             
             for (let point = 0; point < pointCount; point++) {
                 if (lineIndex < lines.length) {
-                    const coords = lines[lineIndex].split(',').map(Number);
-                    frameData.push(coords[0], coords[1], coords[2]); // x, y, z
+                    const cols = lines[lineIndex].split(',').map(Number);
+                    const x = cols[0];
+                    const y = cols[1];
+                    const z = cols[2];
+                    frameData.push(x, y, z); // x, y, z
                     
-                    if (hasTypeData && coords.length >= 4) {
-                        const typeValue = coords[3];
-                        frameTypes.push(typeValue); // type
-                        foundTypes.add(typeValue);
-                    } else {
-                        frameTypes.push(0); // default type
-                        foundTypes.add(0);
+                    // Determine type value
+                    let typeValue = 0;
+                    if (hasTypeData && cols.length >= 4 && (!hasScalars || hasTypeDictionary)) {
+                        typeValue = cols[3];
                     }
+                    frameTypes.push(typeValue);
+                    foundTypes.add(typeValue);
+                    
+                    // Scalars
+                    if (hasScalars) {
+                        const scalarsForPoint = [];
+                        const scalarStartIndex = (hasTypeData && hasTypeDictionary) ? 4 : 3;
+                        for (let si = 0; si < scalarNames.length; si++) {
+                            const val = cols[scalarStartIndex + si];
+                            scalarsForPoint.push(Number.isFinite(val) ? val : NaN);
+                        }
+                        frameScalars.push(scalarsForPoint);
+                    }
+                    
                     lineIndex++;
                 }
             }
             pointsData.push(frameData);
             typeData.push(frameTypes);
+            if (hasScalars) {
+                scalarData.push(frameScalars);
+            }
         }
         
         // Generate default type names if none were provided explicitly
@@ -358,8 +446,43 @@ async function loadCSVData() {
             });
         }
         
+        // Precompute scalar ranges across all frames
+        if (hasScalars && scalarNames.length > 0) {
+            scalarRanges = scalarNames.map(() => ({ min: Infinity, max: -Infinity }));
+            
+            for (let frame = 0; frame < scalarData.length; frame++) {
+                const frameScalars = scalarData[frame];
+                for (let p = 0; p < frameScalars.length; p++) {
+                    const scalarsForPoint = frameScalars[p];
+                    for (let si = 0; si < scalarNames.length; si++) {
+                        const v = scalarsForPoint[si];
+                        if (Number.isFinite(v)) {
+                            if (v < scalarRanges[si].min) scalarRanges[si].min = v;
+                            if (v > scalarRanges[si].max) scalarRanges[si].max = v;
+                        }
+                    }
+                }
+            }
+            
+            // Normalize ranges in case of missing data
+            for (let si = 0; si < scalarRanges.length; si++) {
+                const range = scalarRanges[si];
+                if (!Number.isFinite(range.min) || !Number.isFinite(range.max)) {
+                    range.min = 0;
+                    range.max = 1;
+                }
+            }
+        } else {
+            scalarRanges = [];
+        }
+        
         console.log(`Dataset ${currentDataset} has type data: ${hasTypeData}`);
         console.log('Final type names mapping:', typeNames);
+        console.log(`Dataset ${currentDataset} has scalars: ${hasScalars}`);
+        if (hasScalars) {
+            console.log('Scalar names:', scalarNames);
+            console.log('Scalar ranges:', scalarRanges);
+        }
         
         console.log(`Loaded ${pointsData.length} frames with varying point counts`);
         
@@ -367,14 +490,12 @@ async function loadCSVData() {
         document.querySelector('#info div:first-child').textContent = `Max Points: ${maxPoints}`;
         document.querySelector('#info div:nth-child(2)').textContent = `Total Frames: ${totalFrames}`;
         
-        // Update color button visibility and state
-        console.log('Setting color button visibility to:', hasTypeData ? 'visible' : 'hidden');
-        colorToggleBtn.style.display = hasTypeData ? 'inline-block' : 'none';
-        colorToggleBtn.classList.remove('active');
-        colorByType = false;
+        // Configure color mode options based on available data
+        configureColorModeOptions();
         
-        // Hide legend initially
+        // Hide legends initially
         hideLegend();
+        hideScalarLegend();
         
         // Update slider max value and reset to frame 0
         timeSlider.max = totalFrames - 1;
@@ -502,11 +623,112 @@ function createLegend() {
     document.body.appendChild(legend);
 }
 
-// Update updateInstancedMeshPositions to respect visibleTypes and cross-sections
+// Simple helper to map a scalar value to a color (blue -> green -> red)
+function getScalarColor(scalarIndex, value) {
+    if (!hasScalars || !scalarRanges[scalarIndex]) {
+        return new THREE.Color(0x888888);
+    }
+    const range = scalarRanges[scalarIndex];
+    if (!Number.isFinite(value) || !Number.isFinite(range.min) || !Number.isFinite(range.max) || range.max <= range.min) {
+        return new THREE.Color(0x888888);
+    }
+    
+    let t = (value - range.min) / (range.max - range.min);
+    t = Math.max(0, Math.min(1, t));
+    
+    let r, g, b;
+    if (t < 0.5) {
+        const u = t / 0.5; // 0..1
+        r = 0;
+        g = u;
+        b = 1 - u;
+    } else {
+        const u = (t - 0.5) / 0.5;
+        r = u;
+        g = 1 - u;
+        b = 0;
+    }
+    
+    return new THREE.Color(r, g, b);
+}
+
+// Scalar legend functions
+function createScalarLegend(activeScalarIndex) {
+    // Remove existing scalar legend if it exists
+    const existingLegend = document.getElementById('scalar-legend');
+    if (existingLegend) {
+        existingLegend.remove();
+    }
+    
+    if (!hasScalars || !scalarNames[activeScalarIndex] || !scalarRanges[activeScalarIndex]) return;
+    
+    const isMobile = window.innerWidth <= 768;
+    const legend = document.createElement('div');
+    legend.id = 'scalar-legend';
+    legend.style.cssText = `
+        position: absolute;
+        top: ${isMobile ? '10px' : '120px'};
+        right: ${isMobile ? '10px' : '20px'};
+        background: rgba(0, 0, 0, 0.8);
+        color: white;
+        padding: ${isMobile ? '10px' : '15px'};
+        border-radius: 8px;
+        font-size: ${isMobile ? '10px' : '12px'};
+        font-family: Arial, sans-serif;
+        max-width: ${isMobile ? '150px' : '220px'};
+        z-index: 1000;
+        border: 1px solid #333;
+    `;
+    
+    const title = document.createElement('div');
+    title.textContent = scalarNames[activeScalarIndex];
+    title.style.cssText = 'font-weight: bold; margin-bottom: 8px; color: #fff;';
+    legend.appendChild(title);
+    
+    const rangeInfo = scalarRanges[activeScalarIndex];
+    
+    const gradientBar = document.createElement('div');
+    gradientBar.style.cssText = `
+        width: 160px;
+        height: 12px;
+        background: linear-gradient(to right, #0000ff, #00ff00, #ff0000);
+        border-radius: 4px;
+        margin-bottom: 4px;
+        border: 1px solid #666;
+    `;
+    
+    const labels = document.createElement('div');
+    labels.style.cssText = 'display: flex; justify-content: space-between; font-size: 10px; color: #ccc;';
+    const minLabel = document.createElement('span');
+    const maxLabel = document.createElement('span');
+    minLabel.textContent = rangeInfo.min.toFixed(2);
+    maxLabel.textContent = rangeInfo.max.toFixed(2);
+    labels.appendChild(minLabel);
+    labels.appendChild(maxLabel);
+    
+    legend.appendChild(gradientBar);
+    legend.appendChild(labels);
+    
+    document.body.appendChild(legend);
+}
+
+function showScalarLegend(activeScalarIndex) {
+    createScalarLegend(activeScalarIndex);
+}
+
+function hideScalarLegend() {
+    const legend = document.getElementById('scalar-legend');
+    if (legend) {
+        legend.remove();
+    }
+}
+
+// Update updateInstancedMeshPositions to respect visibleTypes, scalars and cross-sections
 function updateInstancedMeshPositions(frame) {
     if (!points || pointsData.length === 0) return;
     const positions = pointsData[frame];
     const types = typeData[frame];
+    const frameScalars = hasScalars ? scalarData[frame] : null;
     let visibleCount = 0;
 
     for (let i = 0; i < maxPoints; i++) {
@@ -533,13 +755,24 @@ function updateInstancedMeshPositions(frame) {
                 if (showPoint) {
                     points.setMatrixAt(visibleCount, new THREE.Matrix4().setPosition(x, y, z));
                     
-                    // Set color by type if enabled
-                    if (colorByType && hasTypeData) {
+                    // Determine color based on current color mode
+                    let color;
+                    if (colorMode === 'type' && hasTypeData) {
                         const colorIndex = type % typeColors.length;
-                        points.setColorAt(visibleCount, new THREE.Color(typeColors[colorIndex]));
+                        color = new THREE.Color(typeColors[colorIndex]);
+                    } else if (colorMode.startsWith('scalar-') && hasScalars && frameScalars) {
+                        const scalarIndex = parseInt(colorMode.split('-')[1], 10);
+                        if (!Number.isNaN(scalarIndex) && frameScalars[i] && scalarRanges[scalarIndex]) {
+                            const value = frameScalars[i][scalarIndex];
+                            color = getScalarColor(scalarIndex, value);
+                        } else {
+                            color = new THREE.Color(0x888888);
+                        }
                     } else {
-                        points.setColorAt(visibleCount, new THREE.Color(0x888888));
+                        color = new THREE.Color(0x888888);
                     }
+                    
+                    points.setColorAt(visibleCount, color);
                     visibleCount++;
                 }
             }
@@ -665,29 +898,33 @@ function setupEventListeners() {
         setCrossSectionMode('vertical');
     });
 
-    // Color toggle button
-    colorToggleBtn.addEventListener('click', () => {
-        colorByType = !colorByType;
-        colorToggleBtn.classList.toggle('active', colorByType);
-        
-        // Show/hide legend based on color mode
-        if (colorByType && hasTypeData) {
-            showLegend();
-        } else {
-            hideLegend();
-            // Reset all cell types to visible when turning off color mode
-            if (window.visibleTypes) {
-                Object.keys(window.visibleTypes).forEach(typeValue => {
-                    window.visibleTypes[typeValue] = true;
-                });
+    // Color mode selector
+    if (colorModeSelect) {
+        colorModeSelect.addEventListener('change', (e) => {
+            const selected = e.target.value;
+            colorMode = selected || 'default';
+            
+            // Show/hide legends based on color mode
+            if (colorMode === 'type' && hasTypeData) {
+                showLegend();
+                hideScalarLegend();
+            } else if (colorMode.startsWith('scalar-') && hasScalars) {
+                hideLegend();
+                const scalarIndex = parseInt(colorMode.split('-')[1], 10);
+                if (!Number.isNaN(scalarIndex)) {
+                    showScalarLegend(scalarIndex);
+                }
+            } else {
+                hideLegend();
+                hideScalarLegend();
             }
-        }
-        
-        // Update the current frame to apply the color changes
-        if (points && pointsData.length > 0) {
-            updateInstancedMeshPositions(currentFrame);
-        }
-    });
+            
+            // Update the current frame to apply the color changes
+            if (points && pointsData.length > 0) {
+                updateInstancedMeshPositions(currentFrame);
+            }
+        });
+    }
 
     // Window resize
     window.addEventListener('resize', () => {
@@ -925,12 +1162,19 @@ function createMobileControls() {
         controlPanel.appendChild(toggleButton);
     }
 
-    // Move legend to a better position on mobile
+    // Move legends to a better position on mobile
     const existingLegend = document.getElementById('color-legend');
     if (existingLegend) {
         existingLegend.style.top = '10px';
         existingLegend.style.right = '10px';
         existingLegend.style.maxWidth = '150px';
         existingLegend.style.fontSize = '10px';
+    }
+    const existingScalarLegend = document.getElementById('scalar-legend');
+    if (existingScalarLegend) {
+        existingScalarLegend.style.top = '10px';
+        existingScalarLegend.style.right = '10px';
+        existingScalarLegend.style.maxWidth = '150px';
+        existingScalarLegend.style.fontSize = '10px';
     }
 }
